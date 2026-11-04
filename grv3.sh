@@ -1,44 +1,41 @@
 #!/bin/bash
 
 # ==============================================================================
-# Script Name: MPLS-over-GRE Tunnel Manager (Based on GRETUNv2 architecture)
-# Author/Adapted for: Complete MPLS-in-IP Integration & Debugging
+# Script Name: MPLS-over-GRE Tunnel Manager (Final Persistent Edition)
 # ==============================================================================
 
-# Colors Definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
 BLUE='\033[1;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Check Root Access
 if [ "$EUID" -ne 0 ]; then
   echo -e "${RED}[!] Error: This script must be run as root! Use sudo.${NC}"
   exit 1
 fi
 
-# Configuration Storage Path
 CONFIG_FILE="/etc/mpls_gre_config.env"
 SERVICE_FILE="/etc/systemd/system/mpls-gre-tunnel.service"
+WATCHDOG_SERVICE="/etc/systemd/system/mpls-gre-watchdog.service"
+WATCHDOG_TIMER="/etc/systemd/system/mpls-gre-watchdog.timer"
 RESTORE_SCRIPT="/usr/local/bin/restore-mpls-gre.sh"
 
 banner() {
     clear
     echo -e "${CYAN}======================================================${NC}"
-    echo -e "${GREEN}      MPLS-in-IP (GRE) Professional Manager v2.0      ${NC}"
+    echo -e "${GREEN}      MPLS-in-IP (GRE) Professional Manager v3.0      ${NC}"
     echo -e "${CYAN}======================================================${NC}"
 }
 
-# ------------------------------------------------------------------------------
-# 1. Setup & Installation Function
-# ------------------------------------------------------------------------------
 install_mpls_gre() {
     banner
     echo -e "${YELLOW}[+] Starting MPLS-over-GRE Setup Wizard...${NC}\n"
 
-    read -p "Enter Local Public IP (Underlay): " LOCAL_PUB_IP
+    DEFAULT_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+    read -p "Enter Local Public IP (Underlay) [$DEFAULT_IP]: " LOCAL_PUB_IP
+    LOCAL_PUB_IP=${LOCAL_PUB_IP:-$DEFAULT_IP}
     read -p "Enter Remote Public IP (Underlay): " REMOTE_PUB_IP
     read -p "Enter Tunnel Interface Name (default: tun0): " TUN_NAME
     TUN_NAME=${TUN_NAME:-tun0}
@@ -48,42 +45,27 @@ install_mpls_gre() {
     read -p "Enter MPLS Label (e.g., 100): " MPLS_LABEL
 
     echo -e "\n${BLUE}[*] Step 1/6: Enabling Kernel Modules...${NC}"
-    modprobe mpls_router
-    modprobe mpls_iptunnel
+    modprobe ip_gre 2>/dev/null || true
+    modprobe mpls_router 2>/dev/null || true
+    modprobe mpls_iptunnel 2>/dev/null || true
 
-    # Make modules persistent
-    echo "mpls_router" > /etc/modules-load.d/mpls.conf
-    echo "mpls_iptunnel" >> /etc/modules-load.d/mpls.conf
+    cat <<EOF > /etc/modules-load.d/mpls.conf
+ip_gre
+mpls_router
+mpls_iptunnel
+EOF
 
     echo -e "${BLUE}[*] Step 2/6: Configuring Sysctl Parameters...${NC}"
-    sysctl -w net.mpls.platform_labels=1048575 >/dev/null 2>&1
-    
     cat <<EOF > /etc/sysctl.d/99-mpls-tunnel.conf
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
 net.mpls.platform_labels=1048575
 net.mpls.conf.$TUN_NAME.input=1
 EOF
     sysctl --system >/dev/null 2>&1
 
-    echo -e "${BLUE}[*] Step 3/6: Creating GRE Tunnel Interface ($TUN_NAME)...${NC}"
-    if ip link show "$TUN_NAME" > /dev/null 2>&1; then
-        ip link set "$TUN_NAME" down
-        ip tunnel del "$TUN_NAME"
-    fi
-    
-    ip tunnel add "$TUN_NAME" mode gre remote "$REMOTE_PUB_IP" local "$LOCAL_PUB_IP" ttl 255
-    ip link set "$TUN_NAME" up
-    ip addr add "$TUN_LOCAL_IP" dev "$TUN_NAME"
-
-    echo -e "${BLUE}[*] Step 4/6: Enabling MPLS input on interface...${NC}"
-    sysctl -w net.mpls.conf."$TUN_NAME".input=1 >/dev/null 2>&1
-
-    echo -e "${BLUE}[*] Step 5/6: Applying MPLS Encapsulation Route...${NC}"
-    # Remove existing route if present to avoid conflicts
-    ip route del "$DEST_SUBNET" 2>/dev/null
-    ip route add "$DEST_SUBNET" encap mpls "$MPLS_LABEL" via "$TUN_REMOTE_IP" dev "$TUN_NAME"
-
-    echo -e "${BLUE}[*] Step 6/6: Saving Configuration & Setting up Persistence...${NC}"
-    # Save config variables
+    echo -e "${BLUE}[*] Step 3/6: Saving Configuration & Creating Restore Script...${NC}"
     cat <<EOF > "$CONFIG_FILE"
 LOCAL_PUB_IP="$LOCAL_PUB_IP"
 REMOTE_PUB_IP="$REMOTE_PUB_IP"
@@ -93,23 +75,63 @@ TUN_REMOTE_IP="$TUN_REMOTE_IP"
 DEST_SUBNET="$DEST_SUBNET"
 MPLS_LABEL="$MPLS_LABEL"
 EOF
+    chmod 600 "$CONFIG_FILE"
 
-    # Create restore script for systemd
-    cat <<EOF > "$RESTORE_SCRIPT"
+    cat <<'EOF' > "$RESTORE_SCRIPT"
 #!/bin/bash
-source $CONFIG_FILE
-modprobe mpls_router
-modprobe mpls_iptunnel
+CONFIG_FILE="/etc/mpls_gre_config.env"
+[ -f "$CONFIG_FILE" ] || exit 1
+source "$CONFIG_FILE"
+
+# Wait up to 30s for network default route on boot
+for _ in {1..15}; do
+  ip -4 route show default 2>/dev/null | grep -q . && break
+  sleep 2
+done
+
+GATEWAY_IP=$(echo "$TUN_REMOTE_IP" | cut -d'/' -f1)
+if [[ "${1:-}" == "--watchdog" ]]; then
+  if ip link show "$TUN_NAME" >/dev/null 2>&1 && ping -c 2 -W 2 "$GATEWAY_IP" >/dev/null 2>&1; then
+    exit 0
+  fi
+fi
+
+modprobe ip_gre 2>/dev/null || true
+modprobe mpls_router 2>/dev/null || true
+modprobe mpls_iptunnel 2>/dev/null || true
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1
 sysctl -w net.mpls.platform_labels=1048575 >/dev/null 2>&1
-ip tunnel add \$TUN_NAME mode gre remote \$REMOTE_PUB_IP local \$LOCAL_PUB_IP ttl 255
-ip link set \$TUN_NAME up
-ip addr add \$TUN_LOCAL_IP dev \$TUN_NAME
-sysctl -w net.mpls.conf.\$TUN_NAME.input=1 >/dev/null 2>&1
-ip route add \$DEST_SUBNET encap mpls \$MPLS_LABEL via \$TUN_REMOTE_IP dev \$TUN_NAME
+
+if ip link show "$TUN_NAME" > /dev/null 2>&1; then
+  ip link set "$TUN_NAME" down 2>/dev/null || true
+  ip tunnel del "$TUN_NAME" 2>/dev/null || true
+fi
+
+ip tunnel add "$TUN_NAME" mode gre remote "$REMOTE_PUB_IP" local "$LOCAL_PUB_IP" ttl 255
+ip addr add "$TUN_LOCAL_IP" dev "$TUN_NAME"
+ip link set "$TUN_NAME" mtu 1400
+ip link set "$TUN_NAME" up
+
+sysctl -w net.mpls.conf."$TUN_NAME".input=1 >/dev/null 2>&1
+
+if [ -n "$DEST_SUBNET" ] && [ -n "$MPLS_LABEL" ]; then
+  ip route del "$DEST_SUBNET" 2>/dev/null || true
+  ip route add "$DEST_SUBNET" encap mpls "$MPLS_LABEL" via "$GATEWAY_IP" dev "$TUN_NAME"
+fi
+
+if command -v iptables >/dev/null 2>&1; then
+  iptables -C INPUT -p gre -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -j ACCEPT
+  iptables -C OUTPUT -p gre -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p gre -j ACCEPT
+fi
 EOF
     chmod +x "$RESTORE_SCRIPT"
 
-    # Create Systemd Service
+    echo -e "${BLUE}[*] Step 4/6: Activating Tunnel & MPLS Route...${NC}"
+    "$RESTORE_SCRIPT"
+
+    echo -e "${BLUE}[*] Step 5/6: Registering Persistent Systemd Service & Watchdog...${NC}"
     cat <<EOF > "$SERVICE_FILE"
 [Unit]
 Description=MPLS-over-GRE Tunnel Automatic Service
@@ -125,16 +147,37 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable mpls-gre-tunnel.service >/dev/null 2>&1
+    cat <<EOF > "$WATCHDOG_SERVICE"
+[Unit]
+Description=MPLS-over-GRE Tunnel Self-Healing Watchdog
+After=network-online.target
 
-    echo -e "\n${GREEN}[✔] Success! MPLS-in-IP tunnel deployed and persisted successfully.${NC}"
+[Service]
+Type=oneshot
+ExecStart=$RESTORE_SCRIPT --watchdog
+EOF
+
+    cat <<EOF > "$WATCHDOG_TIMER"
+[Unit]
+Description=Run MPLS-over-GRE Watchdog every 20s
+
+[Timer]
+OnBootSec=30s
+OnCalendar=*:*:0/20
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now mpls-gre-tunnel.service >/dev/null 2>&1
+    systemctl enable --now mpls-gre-watchdog.timer >/dev/null 2>&1
+
+    echo -e "\n${GREEN}[✔] Success! MPLS-in-IP tunnel deployed and persisted with watchdog.${NC}"
     read -p "Press [Enter] to return to menu..."
 }
 
-# ------------------------------------------------------------------------------
-# 2. Status & Debugging Function
-# ------------------------------------------------------------------------------
 status_and_debug() {
     banner
     echo -e "${YELLOW}[+] System Status & Deep Debugging Report:${NC}\n"
@@ -169,16 +212,14 @@ status_and_debug() {
         echo -e "${RED}[X] Failed to ping Tunnel Gateway ($GATEWAY_IP). Check firewall or remote peer.${NC}"
     fi
 
-    echo -e "\n${CYAN}--- 5. Systemd Service Status ---${NC}"
+    echo -e "\n${CYAN}--- 5. Systemd Service & Watchdog Status ---${NC}"
     systemctl is-active --quiet mpls-gre-tunnel.service && echo -e "${GREEN}[✔] Persistent service is Active${NC}" || echo -e "${RED}[X] Persistent service is inactive or failed${NC}"
+    systemctl is-active --quiet mpls-gre-watchdog.timer && echo -e "${GREEN}[✔] Watchdog timer is Active${NC}" || echo -e "${RED}[X] Watchdog timer is inactive${NC}"
 
     echo ""
     read -p "Press [Enter] to return to menu..."
 }
 
-# ------------------------------------------------------------------------------
-# 3. Uninstallation Function
-# ------------------------------------------------------------------------------
 uninstall_tunnel() {
     banner
     echo -e "${RED}[!] Warning: This will remove the tunnel, routes, and persistence service.${NC}"
@@ -187,11 +228,12 @@ uninstall_tunnel() {
     if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
         if [ -f "$CONFIG_FILE" ]; then
             source "$CONFIG_FILE"
-            ip link set "$TUN_NAME" down 2>/dev/null
-            ip tunnel del "$TUN_NAME" 2>/dev/null
-        }
-        systemctl disable mpls-gre-tunnel.service >/dev/null 2>&1
-        rm -f "$SERVICE_FILE" "$RESTORE_SCRIPT" "$CONFIG_FILE" /etc/sysctl.d/99-mpls-tunnel.conf
+            ip link set "$TUN_NAME" down 2>/dev/null || true
+            ip tunnel del "$TUN_NAME" 2>/dev/null || true
+        fi
+        systemctl disable --now mpls-gre-watchdog.timer >/dev/null 2>&1 || true
+        systemctl disable --now mpls-gre-tunnel.service >/dev/null 2>&1 || true
+        rm -f "$SERVICE_FILE" "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$RESTORE_SCRIPT" "$CONFIG_FILE" /etc/sysctl.d/99-mpls-tunnel.conf /etc/modules-load.d/mpls.conf
         systemctl daemon-reload
         echo -e "\n${GREEN}[✔] MPLS-over-GRE successfully removed and cleaned up.${NC}"
     else
@@ -200,13 +242,10 @@ uninstall_tunnel() {
     read -p "Press [Enter] to return to menu..."
 }
 
-# ------------------------------------------------------------------------------
-# Main Application Loop
-# ------------------------------------------------------------------------------
 while true; do
     banner
     echo -e "Please choose an option:"
-    echo -e "  ${GREEN}1)${NC} Setup & Deploy MPLS-over-GRE Tunnel"
+    echo -e "  ${GREEN}1)${NC} Setup & Deploy MPLS-over-GRE Tunnel (Auto-Persistent)"
     echo -e "  ${GREEN}2)${NC} Check Status & Run Diagnostics / Debug"
     echo -e "  ${GREEN}3)${NC} Uninstall / Remove Tunnel"
     echo -e "  ${RED}4)${NC} Exit"
