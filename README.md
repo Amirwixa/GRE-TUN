@@ -3,7 +3,7 @@
 
 
 ```bash
-bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/Arash-Ariaye/GRE-TUN/refs/heads/main/GRETUN.sh)
+bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/Amirwixa/GRE-TUN/refs/heads/main/GRETUN.sh)
 ```
 
 📌 ترتیب اجرا:
@@ -67,7 +67,7 @@ bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/Arash-Ariaye/GRE-TUN/re
 ## 🚀 نصب و اجرا (سریع)
 
 ```bash
-git clone https://github.com/Arash-Ariaye/GRE-TUN.git
+git clone https://github.com/Amirwixa/GRE-TUN.git
 cd GRE-TUN
 chmod +x GRETUN.sh
 sudo ./GRETUN.sh
